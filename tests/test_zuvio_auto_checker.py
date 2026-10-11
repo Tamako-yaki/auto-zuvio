@@ -3,14 +3,14 @@ Unit tests for ZuvioAutoChecker class
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 import sys
 import os
 
 # Add parent directory to path to import main module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import ZuvioAutoChecker, UserCredentials, AuthToken, Location
+from main import ZuvioAutoChecker, UserCredentials, AuthToken, Location, CourseService
 
 
 class TestZuvioAutoChecker(unittest.TestCase):
@@ -145,44 +145,118 @@ class TestZuvioAutoChecker(unittest.TestCase):
             self.assertTrue(mock_print.called)
     
     def test_run_checkin_loop_with_available_course(self):
-        """Test check-in loop with available course"""
+        """An open rollcall is checked in only after the five-second delay."""
         auth_token = AuthToken(user_id='12345', access_token='abc123')
         location = Location(latitude='22.123', longitude='120.456')
         courses = [{'course_name': 'Test Course', 'course_id': 'course1'}]
-        
-        with patch.object(self.checker.course_service, 'check_rollcall_availability', return_value='rollcall123'), \
-             patch.object(self.checker.course_service, 'perform_checkin', return_value=(True, "簽到成功！")), \
-             patch('builtins.print'), \
-             patch('time.sleep'), \
-             patch('main.datetime') as mock_datetime:
-            
-            mock_datetime.now.return_value.strftime.return_value = '12:00:00'
-            
-            # Set running to False after first iteration to prevent infinite loop
-            def stop_loop():
+        self.checker.course_service = MagicMock(spec=CourseService)
+        self.checker.course_service.check_rollcall_availability.return_value = 'rollcall123'
+        waited = False
+
+        def wait(seconds):
+            nonlocal waited
+            if seconds == 5:
+                waited = True
+            else:
                 self.checker.running = False
-            
-            with patch('time.sleep', side_effect=stop_loop):
-                self.checker.run_checkin_loop(auth_token, courses, location)
-    
+
+        def checkin(*args):
+            self.assertTrue(waited)
+            return True, "簽到成功！"
+
+        self.checker.course_service.perform_checkin.side_effect = checkin
+        with patch('builtins.print'), \
+             patch('main.random.randint', return_value=1), \
+             patch('main.time.sleep', side_effect=wait) as mock_sleep:
+            self.checker.run_checkin_loop(auth_token, courses, location)
+
+        self.assertEqual(mock_sleep.call_args_list, [call(5), call(1)])
+        self.assertEqual(self.checker.course_service.check_rollcall_availability.call_count, 2)
+        self.checker.course_service.perform_checkin.assert_called_once_with(
+            auth_token, 'rollcall123', location
+        )
+
     def test_run_checkin_loop_no_available_courses(self):
         """Test check-in loop with no available courses"""
         auth_token = AuthToken(user_id='12345', access_token='abc123')
         location = Location(latitude='22.123', longitude='120.456')
         courses = [{'course_name': 'Test Course', 'course_id': 'course1'}]
-        
-        with patch.object(self.checker.course_service, 'check_rollcall_availability', return_value=None), \
+        self.checker.course_service = MagicMock(spec=CourseService)
+        self.checker.course_service.check_rollcall_availability.return_value = None
+
+        def stop_loop(seconds):
+            self.checker.running = False
+
+        with patch('main.random.randint', return_value=1), \
              patch('builtins.print'), \
-             patch('main.datetime') as mock_datetime:
-            
-            mock_datetime.now.return_value.strftime.return_value = '12:00:00'
-            
-            # Set running to False after first iteration
-            def stop_loop():
-                self.checker.running = False
-            
-            with patch('time.sleep', side_effect=stop_loop):
-                self.checker.run_checkin_loop(auth_token, courses, location)
+             patch('main.time.sleep', side_effect=stop_loop) as mock_sleep:
+            self.checker.run_checkin_loop(auth_token, courses, location)
+
+        mock_sleep.assert_called_once_with(1)
+        self.checker.course_service.perform_checkin.assert_not_called()
+
+    def test_run_checkin_loop_rollcall_closes_or_changes_during_delay(self):
+        """A closed or replaced rollcall is skipped, and a later one can succeed."""
+        auth_token = AuthToken(user_id='12345', access_token='abc123')
+        location = Location(latitude='22.123', longitude='120.456')
+        courses = [{'course_name': 'Test Course', 'course_id': 'course1'}]
+
+        for delayed_rollcall_id in (None, 'replacement123'):
+            with self.subTest(delayed_rollcall_id=delayed_rollcall_id):
+                self.checker.running = True
+                service = MagicMock(spec=CourseService)
+                self.checker.course_service = service
+                service.check_rollcall_availability.return_value = 'rollcall123'
+                service.perform_checkin.return_value = (True, "簽到成功！")
+                poll_count = 0
+
+                def wait(seconds):
+                    nonlocal poll_count
+                    if seconds == 5 and poll_count == 0:
+                        service.check_rollcall_availability.return_value = delayed_rollcall_id
+                    elif seconds == 1:
+                        poll_count += 1
+                        if poll_count == 1:
+                            service.perform_checkin.assert_not_called()
+                            service.check_rollcall_availability.return_value = 'later123'
+                        else:
+                            self.checker.running = False
+
+                with patch('main.random.randint', return_value=1), \
+                     patch('builtins.print') as mock_print, \
+                     patch('main.time.sleep', side_effect=wait):
+                    self.checker.run_checkin_loop(auth_token, courses, location)
+
+                mock_print.assert_any_call("Test Course - 簽到已關閉或變更，略過此次簽到")
+                service.perform_checkin.assert_called_once_with(auth_token, 'later123', location)
+
+    def test_run_checkin_loop_failed_checkin_keeps_monitoring(self):
+        """A server rejection after the delay does not prevent a later check-in."""
+        auth_token = AuthToken(user_id='12345', access_token='abc123')
+        location = Location(latitude='22.123', longitude='120.456')
+        courses = [{'course_name': 'Test Course', 'course_id': 'course1'}]
+        service = MagicMock(spec=CourseService)
+        self.checker.course_service = service
+        service.check_rollcall_availability.return_value = 'rollcall123'
+        service.perform_checkin.side_effect = [(False, "簽到已結束"), (True, "簽到成功！")]
+
+        def wait(seconds):
+            if seconds == 1:
+                if service.perform_checkin.call_count == 1:
+                    service.check_rollcall_availability.return_value = 'later123'
+                else:
+                    self.checker.running = False
+
+        with patch('main.random.randint', return_value=1), \
+             patch('builtins.print') as mock_print, \
+             patch('main.time.sleep', side_effect=wait):
+            self.checker.run_checkin_loop(auth_token, courses, location)
+
+        mock_print.assert_any_call("Test Course - 簽到已結束")
+        self.assertEqual(service.perform_checkin.call_args_list, [
+            call(auth_token, 'rollcall123', location),
+            call(auth_token, 'later123', location)
+        ])
 
 
 if __name__ == '__main__':

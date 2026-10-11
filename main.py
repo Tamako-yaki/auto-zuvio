@@ -372,15 +372,25 @@ class ZuvioAutoChecker:
                 rollcall_id = self.course_service.check_rollcall_availability(course['course_id'])
                 
                 if rollcall_id:
+                    has_course_available = True
+                    logger.info(f"偵測到簽到 (課程ID: {course['course_id']})，等待 5 秒後確認")
+                    time.sleep(5)
+
+                    # Confirm the same rollcall is still open before checking in.
+                    current_rollcall_id = self.course_service.check_rollcall_availability(course['course_id'])
+                    if current_rollcall_id != rollcall_id:
+                        print(f"{course['course_name']} - 簽到已關閉或變更，略過此次簽到")
+                        continue
+
                     success, message = self.course_service.perform_checkin(
                         auth_token, rollcall_id, location
                     )
                     
                     print(f"{course['course_name']} - {message}")
-                    has_course_available = True
                     
-                    # Add checked-in courses to the already checked list
-                    already_checked.append(course)
+                    # Only stop monitoring a course after a successful check-in.
+                    if success:
+                        already_checked.append(course)
             
             if not has_course_available:
                 current_time = datetime.now().strftime('%H:%M:%S')
